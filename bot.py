@@ -185,7 +185,7 @@ async def on_message(message):
     # -> DỊCH SANG Ý CÔNG KHAI
     # =====================================
 
-    if message.author.id == OWNER_USER_ID and language == "vi":
+   if language == "vi":
 
         try:
             translated = translate(text, "it")
