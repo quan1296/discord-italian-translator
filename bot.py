@@ -494,7 +494,7 @@ async def on_message(message):
 
     if (
         sender_id in enabled_users
-        and language == "vi"
+        and language == "it"
     ):
 
         try:
