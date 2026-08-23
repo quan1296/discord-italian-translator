@@ -1,3 +1,4 @@
 discord.py
 deep-translator
 langdetect
+requests
