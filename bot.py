@@ -33,6 +33,10 @@ USER_DATA_FILE = os.path.join(
 
 WEBHOOK_NAME = "Dich Italian Translator"
 
+# Cache webhook do chính bot tạo
+OUR_WEBHOOK_IDS = set()
+WEBHOOK_CACHE = {}
+
 
 # =========================================================
 # NGÔN NGỮ
@@ -64,7 +68,7 @@ LANGUAGE_NAMES = {
 
 
 # =========================================================
-# DỮ LIỆU NGƯỜI DÙNG
+# DỮ LIỆU USER
 # =========================================================
 
 def load_user_data():
@@ -93,7 +97,6 @@ def save_user_data():
             "w",
             encoding="utf-8"
         ) as f:
-
             json.dump(
                 user_data,
                 f,
@@ -139,7 +142,7 @@ def detect_language(text):
 
 
 # =========================================================
-# KIỂM TRA BẢN DỊCH
+# KIỂM TRA KẾT QUẢ DỊCH
 # =========================================================
 
 def is_valid_translation(result):
@@ -172,7 +175,7 @@ def is_valid_translation(result):
 
 
 # =========================================================
-# DỊCH 1 - GOOGLE TRANSLATOR
+# DỊCH 1 - GOOGLETRANSLATOR
 # =========================================================
 
 def google_translator_method(text, target):
@@ -258,7 +261,6 @@ async def translate(text, target):
         mymemory_method
     ]
 
-    # Thử 2 vòng
     for round_number in range(2):
 
         for method in methods:
@@ -291,42 +293,122 @@ async def translate(text, target):
 # WEBHOOK
 # =========================================================
 
-async def get_translation_webhook(channel):
+def get_webhook_container(channel):
 
-    # Nếu đang ở Thread thì webhook thuộc kênh cha
     if isinstance(channel, discord.Thread):
+        return channel.parent
 
-        parent = channel.parent
-
-        if parent is None:
-            return None
-
-        webhooks = await parent.webhooks()
-
-        for webhook in webhooks:
-            if webhook.name == WEBHOOK_NAME:
-                return webhook
-
-        return await parent.create_webhook(
-            name=WEBHOOK_NAME,
-            reason="Automatic translation"
-        )
-
-    # Kênh chữ bình thường
     if isinstance(channel, discord.TextChannel):
+        return channel
 
-        webhooks = await channel.webhooks()
+    return None
+
+
+async def find_translation_webhook(
+    channel,
+    create=False
+):
+
+    container = get_webhook_container(
+        channel
+    )
+
+    if container is None:
+        return None
+
+    # Cache
+    cached = WEBHOOK_CACHE.get(
+        container.id
+    )
+
+    if cached:
+        OUR_WEBHOOK_IDS.add(
+            cached.id
+        )
+        return cached
+
+    try:
+
+        webhooks = await container.webhooks()
 
         for webhook in webhooks:
+
             if webhook.name == WEBHOOK_NAME:
+
+                WEBHOOK_CACHE[
+                    container.id
+                ] = webhook
+
+                OUR_WEBHOOK_IDS.add(
+                    webhook.id
+                )
+
                 return webhook
 
-        return await channel.create_webhook(
-            name=WEBHOOK_NAME,
-            reason="Automatic translation"
+        if create:
+
+            webhook = await container.create_webhook(
+                name=WEBHOOK_NAME,
+                reason="Automatic translation"
+            )
+
+            WEBHOOK_CACHE[
+                container.id
+            ] = webhook
+
+            OUR_WEBHOOK_IDS.add(
+                webhook.id
+            )
+
+            return webhook
+
+    except Exception as e:
+
+        print(
+            "❌ Lỗi tìm/tạo webhook:",
+            e
         )
 
     return None
+
+
+async def is_our_generated_message(
+    message
+):
+
+    # Chính bot Dich italian
+    if (
+        client.user
+        and message.author.id == client.user.id
+    ):
+        return True
+
+    # Không phải webhook
+    if not message.webhook_id:
+        return False
+
+    # Webhook đã biết
+    if message.webhook_id in OUR_WEBHOOK_IDS:
+        return True
+
+    # Kiểm tra webhook của kênh
+    webhook = await find_translation_webhook(
+        message.channel,
+        create=False
+    )
+
+    if (
+        webhook
+        and webhook.id == message.webhook_id
+    ):
+        OUR_WEBHOOK_IDS.add(
+            webhook.id
+        )
+
+        return True
+
+    # Webhook khác/app khác
+    return False
 
 
 async def replace_with_italian(
@@ -336,8 +418,9 @@ async def replace_with_italian(
 
     try:
 
-        webhook = await get_translation_webhook(
-            message.channel
+        webhook = await find_translation_webhook(
+            message.channel,
+            create=True
         )
 
         if webhook is None:
@@ -349,7 +432,7 @@ async def replace_with_italian(
             else None
         )
 
-        # Nếu là Thread
+        # Thread
         if isinstance(
             message.channel,
             discord.Thread
@@ -372,8 +455,7 @@ async def replace_with_italian(
                 allowed_mentions=discord.AllowedMentions.none()
             )
 
-        # QUAN TRỌNG:
-        # Chỉ xóa tin gốc sau khi webhook gửi thành công
+        # Chỉ xóa sau khi gửi thành công
         await message.delete()
 
         return True
@@ -381,7 +463,7 @@ async def replace_with_italian(
     except discord.Forbidden:
 
         print(
-            "❌ Bot thiếu quyền Manage Messages "
+            "❌ Thiếu Manage Messages "
             "hoặc Manage Webhooks."
         )
 
@@ -390,11 +472,82 @@ async def replace_with_italian(
     except Exception as e:
 
         print(
-            "❌ Lỗi thay thế tin nhắn:",
+            "❌ Lỗi thay thế tin:",
             e
         )
 
         return False
+
+
+# =========================================================
+# GỬI BẢN DỊCH RIÊNG
+# CHO TẤT CẢ USER ĐANG BẬT
+# =========================================================
+
+async def distribute_italian_message(
+    italian_text,
+    sender_name,
+    exclude_user_id=None
+):
+
+    for user_id, data in list(
+        user_data.items()
+    ):
+
+        # Chưa bật
+        if not data.get("enabled"):
+            continue
+
+        # Không gửi lại cho người gửi
+        if (
+            exclude_user_id is not None
+            and int(user_id)
+            == exclude_user_id
+        ):
+            continue
+
+        target_language = data.get(
+            "language"
+        )
+
+        if not target_language:
+            continue
+
+        # User dùng Italian
+        if target_language == "it":
+            continue
+
+        translated = await translate(
+            italian_text,
+            target_language
+        )
+
+        if not translated:
+            continue
+
+        try:
+
+            user = await client.fetch_user(
+                int(user_id)
+            )
+
+            await user.send(
+                f"**{sender_name}:** {translated}"
+            )
+
+        except discord.Forbidden:
+
+            print(
+                f"⚠️ User {user_id} "
+                f"đang chặn DM."
+            )
+
+        except Exception as e:
+
+            print(
+                f"❌ Lỗi gửi DM "
+                f"cho {user_id}: {e}"
+            )
 
 
 # =========================================================
@@ -406,12 +559,21 @@ async def on_ready():
 
     try:
         await tree.sync()
-        print("✅ Slash Commands đã đồng bộ")
+
+        print(
+            "✅ Slash Commands đã đồng bộ"
+        )
 
     except Exception as e:
-        print("❌ Lỗi sync:", e)
 
-    print(f"✅ Bot online: {client.user}")
+        print(
+            "❌ Lỗi sync:",
+            e
+        )
+
+    print(
+        f"✅ Bot online: {client.user}"
+    )
 
 
 # =========================================================
@@ -554,9 +716,11 @@ async def ngonngu(
     )
 
     if ngon_ngu.value == "en":
+
         response = text_en
 
     else:
+
         response = await translate(
             text_en,
             ngon_ngu.value
@@ -606,6 +770,7 @@ async def batdich(
         response = text_en
 
     else:
+
         response = await translate(
             text_en,
             target
@@ -653,6 +818,7 @@ async def tatdich(
         response = text_en
 
     else:
+
         response = await translate(
             text_en,
             target
@@ -703,9 +869,12 @@ async def help_command(
         "📜 /dichcu 1-100\n"
         "Translate previous Italian messages.\n\n"
 
-        "💬 When enabled, a message written in "
-        "a language other than Italian is translated "
-        "into Italian and replaces the original message.\n\n"
+        "💬 Messages written in another language "
+        "can be translated into Italian and replace "
+        "the original message.\n\n"
+
+        "🤖 Italian messages from other apps/bots "
+        "are also translated.\n\n"
 
         "🇮🇹 Italian messages are translated into "
         "your selected language."
@@ -783,13 +952,15 @@ async def dichcu(
 
         for msg in messages:
 
-            if msg.author.bot:
+            # Chỉ bỏ qua chính bot Dich italian
+            if (
+                client.user
+                and msg.author.id == client.user.id
+            ):
                 continue
 
-            if msg.webhook_id:
-                # Webhook chứa bản Ý đã dịch
-                # nên vẫn xem đó là tiếng Ý nếu cần
-                pass
+            # KHÔNG bỏ qua bot/app khác
+            # KHÔNG bỏ qua webhook translation trong history
 
             if msg.author.id == interaction.user.id:
                 continue
@@ -849,6 +1020,7 @@ async def dichcu(
                 current_message = addition
 
             else:
+
                 current_message += addition
 
         if current_message:
@@ -894,13 +1066,17 @@ async def on_message(message):
     if message.guild is None:
         return
 
-    # Bỏ qua chính bot
-    if message.author.bot:
-        return
+    # =====================================================
+    # CHỈ BỎ QUA:
+    # - chính bot Dich italian
+    # - webhook do Dich italian tạo
+    #
+    # APP/BOT khác vẫn được xử lý
+    # =====================================================
 
-    # Bỏ qua tin do webhook tạo
-    # tránh bot dịch lại bản dịch của chính mình
-    if message.webhook_id:
+    if await is_our_generated_message(
+        message
+    ):
         return
 
     text = (
@@ -918,6 +1094,31 @@ async def on_message(message):
     if not language:
         return
 
+
+    # =====================================================
+    # TIN TỪ APP/BOT KHÁC
+    #
+    # Nếu là Italian
+    # -> vẫn dịch cho user đang bật
+    # =====================================================
+
+    if message.author.bot:
+
+        if language == "it":
+
+            await distribute_italian_message(
+                italian_text=text,
+                sender_name=message.author.display_name,
+                exclude_user_id=None
+            )
+
+        return
+
+
+    # =====================================================
+    # TIN TỪ NGƯỜI THẬT
+    # =====================================================
+
     sender_id = message.author.id
 
     sender_data = get_user(
@@ -926,12 +1127,11 @@ async def on_message(message):
 
 
     # =====================================================
-    # NGƯỜI ĐÃ BẬT DỊCH
-    # VIẾT NGÔN NGỮ KHÁC TIẾNG Ý
+    # USER ĐÃ BẬT DỊCH
+    # GỬI NGÔN NGỮ KHÁC ITALIAN
     #
-    # -> DỊCH SANG Ý
-    # -> ĐĂNG DƯỚI TÊN + AVATAR NGƯỜI GỬI
-    # -> XÓA TIN GỐC
+    # -> DỊCH SANG ITALIAN
+    # -> WEBHOOK THAY TIN GỐC
     # =====================================================
 
     if (
@@ -939,8 +1139,7 @@ async def on_message(message):
         and language != "it"
     ):
 
-        # Nếu chưa tự chọn /ngonngu
-        # bot học ngôn ngữ người dùng
+        # Auto học ngôn ngữ nếu chưa chọn thủ công
         if not sender_data.get(
             "manual_language"
         ):
@@ -961,80 +1160,40 @@ async def on_message(message):
             "it"
         )
 
-        # Nếu dịch thất bại
-        # GIỮ NGUYÊN TIN GỐC
+        # Nếu dịch lỗi -> giữ tin gốc
         if not translated:
             return
 
-        await replace_with_italian(
+        success = await replace_with_italian(
             message,
             translated
         )
+
+        # Nếu đã thay thành công,
+        # gửi bản dịch riêng cho các user khác
+        if success:
+
+            await distribute_italian_message(
+                italian_text=translated,
+                sender_name=message.author.display_name,
+                exclude_user_id=sender_id
+            )
 
         return
 
 
     # =====================================================
-    # CÓ NGƯỜI GỬI TIẾNG Ý
-    #
-    # -> DỊCH THEO NGÔN NGỮ
-    # CỦA TỪNG USER ĐÃ BẬT
+    # NGƯỜI THẬT GỬI ITALIAN
+    # -> DỊCH CHO TẤT CẢ USER ĐANG BẬT
     # =====================================================
 
     if language == "it":
 
-        for user_id, data in list(
-            user_data.items()
-        ):
-
-            if not data.get("enabled"):
-                continue
-
-            if int(user_id) == sender_id:
-                continue
-
-            target_language = data.get(
-                "language"
-            )
-
-            if not target_language:
-                continue
-
-            if target_language == "it":
-                continue
-
-            translated = await translate(
-                text,
-                target_language
-            )
-
-            if not translated:
-                continue
-
-            try:
-
-                user = await client.fetch_user(
-                    int(user_id)
-                )
-
-                await user.send(
-                    f"**{message.author.display_name}:** "
-                    f"{translated}"
-                )
-
-            except discord.Forbidden:
-
-                print(
-                    f"⚠️ Không gửi được DM "
-                    f"cho {user_id}"
-                )
-
-            except Exception as e:
-
-                print(
-                    f"❌ Lỗi gửi DM cho "
-                    f"{user_id}: {e}"
-                )
+        await distribute_italian_message(
+            italian_text=text,
+            sender_name=message.author.display_name,
+            exclude_user_id=sender_id
+        )
 
 
 # =========================================================
